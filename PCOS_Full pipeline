@@ -1,1 +1,1536 @@
+import os
+import re
+import json
+import warnings
+from datetime import datetime
 
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from scipy import stats
+
+from sklearn.base import clone
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.model_selection import (
+    StratifiedKFold,
+    RepeatedStratifiedKFold,
+    RandomizedSearchCV,
+)
+from sklearn.inspection import permutation_importance
+from sklearn.dummy import DummyClassifier
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.calibration import calibration_curve
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    roc_curve,
+    precision_recall_curve,
+    confusion_matrix,
+    brier_score_loss,
+    mean_squared_error,
+    mean_absolute_error,
+    r2_score,
+)
+
+# Optional dependencies are imported defensively so that the absence of one
+# library does not abort the entire run.
+try:
+    from xgboost import XGBClassifier
+    HAS_XGB = True
+except ImportError:
+    HAS_XGB = False
+    print("WARNING: xgboost not available. XGBoost models will be skipped.")
+
+try:
+    from lightgbm import LGBMClassifier
+    HAS_LGB = True
+except ImportError:
+    HAS_LGB = False
+    print("WARNING: lightgbm not available. LightGBM models will be skipped.")
+
+try:
+    import shap
+    HAS_SHAP = True
+except ImportError:
+    HAS_SHAP = False
+    print("WARNING: shap not available. Interpretability section will be skipped.")
+
+try:
+    import joblib
+    HAS_JOBLIB = True
+except ImportError:
+    HAS_JOBLIB = False
+
+
+# ----------------------------- CONFIGURATION ---------------------------------
+
+FILE_PATH = "PCOS data response (1)(1).xlsx"   # adjust to the local path
+
+RANDOM_STATE = 42
+
+# Outer resampling. Repeated stratified k-fold is used rather than a single
+# 5-fold split because with n = 99 a single split produces fold-to-fold
+# variation large enough to reverse the model ranking by chance.
+OUTER_SPLITS = 5
+OUTER_REPEATS = 5          # 25 outer fits per model per feature set
+
+# Inner resampling used exclusively for hyperparameter selection.
+INNER_SPLITS = 3
+N_SEARCH_ITER = 15
+
+N_BOOTSTRAP = 2000         # bootstrap replicates for AUC confidence intervals
+
+# Plausibility bounds applied after unit parsing. Values outside these ranges
+# are set to missing rather than silently retained.
+HEIGHT_INCHES_RANGE = (54.0, 78.0)     # 137 cm to 198 cm
+WEIGHT_KG_RANGE = (25.0, 200.0)
+BMI_RANGE = (12.0, 60.0)
+AGE_RANGE = (10.0, 70.0)
+
+# A symptom token must appear at least this many times to become a feature.
+MIN_SYMPTOM_FREQ = 5
+
+np.random.seed(RANDOM_STATE)
+sns.set_theme(style="whitegrid", context="notebook")
+matplotlib.rcParams["figure.dpi"] = 110
+matplotlib.rcParams["savefig.dpi"] = 300
+
+
+# Works in a plain script as well as in Jupyter.
+try:
+    display                                    # noqa: F821
+except NameError:
+    def display(obj):                          # noqa: A001
+        print(obj)
+
+
+# =============================================================================
+# 2. OUTPUT DIRECTORIES
+# =============================================================================
+
+HOME_DIR = os.getcwd()
+RESULT_DIR = os.path.join(HOME_DIR, "PCOS_AI_Results")
+FIG_DIR = os.path.join(RESULT_DIR, "Figures")
+MODEL_DIR = os.path.join(RESULT_DIR, "Models")
+TABLE_DIR = os.path.join(RESULT_DIR, "Tables")
+
+for directory in (RESULT_DIR, FIG_DIR, MODEL_DIR, TABLE_DIR):
+    os.makedirs(directory, exist_ok=True)
+
+print("Working directory :", HOME_DIR)
+print("Results directory :", RESULT_DIR)
+
+
+def save_figure(filename):
+    """Save the current figure to the figures directory and close it."""
+    plt.savefig(os.path.join(FIG_DIR, filename), dpi=300, bbox_inches="tight")
+    plt.show()
+    plt.close()
+
+
+def save_table(dataframe, filename):
+    """Persist a table and return it unchanged for chaining."""
+    dataframe.to_csv(os.path.join(TABLE_DIR, filename), index=False)
+    return dataframe
+
+
+# =============================================================================
+# 3. LOAD DATA AND NORMALISE COLUMN NAMES
+# =============================================================================
+
+df_raw = pd.read_excel(FILE_PATH)
+print("\nRaw shape:", df_raw.shape)
+
+
+def clean_column_name(col):
+    """Collapse whitespace and strip trailing punctuation from a header."""
+    col = str(col).replace("\n", " ")
+    col = re.sub(r"\s+", " ", col).strip()
+    col = col.rstrip("?:").strip()
+    return col
+
+
+df = df_raw.copy()
+df.columns = [clean_column_name(c) for c in df.columns]
+
+print("\nNormalised columns:")
+for i, col in enumerate(df.columns):
+    print(f"  {i:2d} | {col}")
+
+
+def find_column(df, *keywords, required=True):
+    """
+    Resolve a column from keywords, case insensitively, using three passes of
+    decreasing strictness. Raises when a pass is ambiguous rather than
+    silently taking the first hit.
+
+    Pass 1  exact match on the whole normalised header  ('age' -> 'Age')
+    Pass 2  whole-word match, so that 'age' does not match 'average' and
+            'sleep' does not match 'sleeping'
+    Pass 3  plain substring match, as a last resort
+
+    Pass 2 is what the previous version was missing: a bare substring test
+    binds 'age' to 'Age', 'On average, how many hours ... social media' and
+    'On average, how many hours do you sleep', which is a genuine ambiguity
+    rather than a bug in the header cleaning.
+    """
+    lowered = [k.lower() for k in keywords]
+    joined = " ".join(lowered)
+
+    def resolve(candidates, pass_name):
+        if len(candidates) == 1:
+            return candidates[0]
+        if len(candidates) > 1:
+            raise KeyError(
+                f"Ambiguous match for {keywords} during {pass_name}: {candidates}"
+            )
+        return None
+
+    # Pass 1: exact
+    match = resolve([c for c in df.columns if c.lower() == joined], "exact match")
+    if match is not None:
+        return match
+
+    # Pass 2: whole word
+    def contains_word(column, keyword):
+        return re.search(rf"\b{re.escape(keyword)}\b", column.lower()) is not None
+
+    word_matches = [
+        c for c in df.columns if all(contains_word(c, k) for k in lowered)
+    ]
+    match = resolve(word_matches, "whole-word match")
+    if match is not None:
+        return match
+
+    # Pass 3: substring
+    substring_matches = [
+        c for c in df.columns if all(k in c.lower() for k in lowered)
+    ]
+    match = resolve(substring_matches, "substring match")
+    if match is not None:
+        return match
+
+    if required:
+        raise KeyError(
+            f"No column matched {keywords}. Available columns: {list(df.columns)}"
+        )
+    return None
+
+
+COL_AGE = find_column(df, "age")
+COL_WEIGHT = find_column(df, "weight")
+COL_HEIGHT = find_column(df, "height")
+COL_CYCLE = find_column(df, "menstral")           # note the source spelling
+COL_TARGET = find_column(df, "medically diagnosed")
+COL_SYMPTOMS = find_column(df, "symptoms")
+COL_TESTS = find_column(df, "test for diagnoses", required=False)
+COL_RESULTS = find_column(df, "level of results", required=False)
+COL_FAMILY = find_column(df, "family history")
+COL_SOCIAL_HOURS = find_column(df, "social media daily")
+COL_SOCIAL_STRESS = find_column(df, "stress or anxiety")
+COL_SLEEP = find_column(df, "sleep per night")
+COL_FASTFOOD = find_column(df, "fast food")
+COL_SUPPLEMENTS = find_column(df, "dietary supplements")
+
+# Print the resolved bindings. Check these once before trusting any output:
+# a silently mis-bound column is far harder to detect downstream than an
+# exception at load time.
+print("\nRESOLVED COLUMN BINDINGS")
+for label, column in [
+    ("age", COL_AGE), ("weight", COL_WEIGHT), ("height", COL_HEIGHT),
+    ("cycle", COL_CYCLE), ("target", COL_TARGET), ("symptoms", COL_SYMPTOMS),
+    ("tests", COL_TESTS), ("results", COL_RESULTS), ("family history", COL_FAMILY),
+    ("social media hours", COL_SOCIAL_HOURS), ("social media stress", COL_SOCIAL_STRESS),
+    ("sleep", COL_SLEEP), ("fast food", COL_FASTFOOD), ("supplements", COL_SUPPLEMENTS),
+]:
+    print(f"  {label:22s} -> {column}")
+
+
+# =============================================================================
+# 4. TARGET CONSTRUCTION
+# =============================================================================
+
+def to_binary_yes_no(series):
+    """Map free-text yes/no responses to 1/0, leaving anything else missing."""
+    normalised = series.astype(str).str.strip().str.lower()
+    return normalised.map({
+        "yes": 1, "y": 1, "true": 1, "1": 1,
+        "no": 0, "n": 0, "false": 0, "0": 0,
+    })
+
+
+df["PCOS"] = to_binary_yes_no(df[COL_TARGET])
+
+n_before = len(df)
+df = df.dropna(subset=["PCOS"]).reset_index(drop=True)
+print(f"\nRows dropped for unusable target: {n_before - len(df)}")
+
+y = df["PCOS"].astype(int)
+
+print("\nTarget distribution:")
+print(y.value_counts().rename({0: "No PCOS", 1: "PCOS"}))
+print("\nPrevalence: %.1f%%" % (100 * y.mean()))
+
+# The majority-class baseline. Every model reported later must be compared
+# against this number, not against zero.
+MAJORITY_BASELINE = max(y.mean(), 1 - y.mean())
+print("Majority-class accuracy baseline: %.3f" % MAJORITY_BASELINE)
+
+
+# =============================================================================
+# 5. UNIT-AWARE PARSING OF ANTHROPOMETRIC FIELDS
+# =============================================================================
+
+def parse_weight_kg(value):
+    """
+    Parse weight to kilograms. Handles bare numbers, '58 kg', '40kg', and
+    pound-denominated entries.
+    """
+    if pd.isna(value):
+        return np.nan
+
+    if isinstance(value, (int, float, np.number)):
+        weight = float(value)
+    else:
+        text = str(value).lower().strip()
+        number = re.search(r"(\d+(?:[.,]\d+)?)", text)
+        if not number:
+            return np.nan
+        weight = float(number.group(1).replace(",", "."))
+        if "lb" in text or "pound" in text:
+            weight *= 0.453592
+
+    if not (WEIGHT_KG_RANGE[0] <= weight <= WEIGHT_KG_RANGE[1]):
+        return np.nan
+    return weight
+
+
+def parse_height_inches(value):
+    """
+    Parse height to inches from the heterogeneous formats present in this
+    survey. Resolution order matters, because a bare 5.4 in this dataset
+    means five feet four inches, not 5.4 feet and not 5.4 metres.
+
+    Handled forms:
+        "158 cm", "170cm"            -> centimetres
+        "1.62"                       -> metres
+        "5'4", "5’4", "5,2\"", "5\"7", "5/2 or 5/3"
+        "5 feet 3 inches", "4.4 ft", "5 feet"
+        "5.1 inches", "5 inch"       -> respondent meant feet
+        5.4, 5.7, 6.5 (float)        -> feet and inches
+    """
+    if pd.isna(value):
+        return np.nan
+
+    inches = np.nan
+
+    # ---- numeric entries -----------------------------------------------
+    if isinstance(value, (int, float, np.number)):
+        number = float(value)
+        if 1.2 <= number <= 2.2:                       # metres
+            inches = number * 39.3701
+        elif 100 <= number <= 220:                     # centimetres
+            inches = number / 2.54
+        elif 4.0 <= number <= 7.0:                     # feet.inches
+            inches = _feet_decimal_to_inches(number)
+        else:
+            return np.nan
+        return _bounded_height(inches)
+
+    text = str(value).lower().strip()
+    text = text.replace("\u2019", "'").replace("\u2018", "'")
+    text = text.replace("\u201d", '"').replace("\u201c", '"')
+
+    # ---- explicit metric units ------------------------------------------
+    if "cm" in text:
+        number = re.search(r"(\d+(?:\.\d+)?)", text)
+        if number:
+            inches = float(number.group(1)) / 2.54
+        return _bounded_height(inches)
+
+    if re.search(r"\bm\b|meter|metre", text) and "c" not in text.replace("metre", ""):
+        number = re.search(r"(\d+(?:\.\d+)?)", text)
+        if number:
+            inches = float(number.group(1)) * 39.3701
+        return _bounded_height(inches)
+
+    # ---- "5 feet 3 inches" / "5 feet" / "4.4 ft" ------------------------
+    match = re.search(r"(\d+(?:\.\d+)?)\s*(?:feet|foot|ft)\s*(\d+(?:\.\d+)?)?", text)
+    if match:
+        feet = float(match.group(1))
+        if match.group(2) is not None:
+            inches = feet * 12 + float(match.group(2))
+        else:
+            inches = _feet_decimal_to_inches(feet)
+        return _bounded_height(inches)
+
+    # ---- separator forms: 5'4  5,2"  5"7  5/2 ---------------------------
+    match = re.search(r"(\d+)\s*['\",/]\s*(\d+)", text)
+    if match:
+        inches = float(match.group(1)) * 12 + float(match.group(2))
+        return _bounded_height(inches)
+
+    # ---- "5'" or "5\"" with no inches component -------------------------
+    match = re.match(r"^\s*(\d+)\s*['\"]\s*$", text)
+    if match:
+        return _bounded_height(float(match.group(1)) * 12)
+
+    # ---- "5 inch" / "5.1 inches": respondent meant feet -----------------
+    if "inch" in text:
+        number = re.search(r"(\d+(?:\.\d+)?)", text)
+        if number:
+            value_float = float(number.group(1))
+            if value_float <= 8:                       # 5 "inches" means 5 feet
+                inches = _feet_decimal_to_inches(value_float)
+            else:
+                inches = value_float
+        return _bounded_height(inches)
+
+    # ---- bare numeric string --------------------------------------------
+    number = re.search(r"(\d+(?:\.\d+)?)", text)
+    if number:
+        return parse_height_inches(float(number.group(1)))
+
+    return np.nan
+
+
+def _feet_decimal_to_inches(number):
+    """
+    Convert a feet.decimal entry. The decimal portion is read as inches when
+    it is a plausible inch count (5.4 -> 5 ft 4 in) and as a fraction of a
+    foot otherwise (5.75 -> 5 ft 9 in).
+    """
+    feet = int(number)
+    fractional_text = f"{number:.10f}".split(".")[1].rstrip("0")
+    if fractional_text == "":
+        return feet * 12.0
+    as_int = int(fractional_text[:2]) if len(fractional_text) >= 2 else int(fractional_text)
+    if len(fractional_text) == 1 and as_int <= 11:
+        return feet * 12.0 + as_int
+    if len(fractional_text) >= 2 and as_int <= 11:
+        return feet * 12.0 + as_int
+    return feet * 12.0 + (number - feet) * 12.0
+
+
+def _bounded_height(inches):
+    if pd.isna(inches):
+        return np.nan
+    if not (HEIGHT_INCHES_RANGE[0] <= inches <= HEIGHT_INCHES_RANGE[1]):
+        return np.nan
+    return float(inches)
+
+
+df["Age_years"] = pd.to_numeric(df[COL_AGE], errors="coerce")
+df.loc[~df["Age_years"].between(*AGE_RANGE), "Age_years"] = np.nan
+
+df["Weight_kg"] = df[COL_WEIGHT].apply(parse_weight_kg)
+df["Height_in"] = df[COL_HEIGHT].apply(parse_height_inches)
+df["Height_m"] = df["Height_in"] * 0.0254
+df["BMI"] = df["Weight_kg"] / (df["Height_m"] ** 2)
+df.loc[~df["BMI"].between(*BMI_RANGE), "BMI"] = np.nan
+
+parsing_report = pd.DataFrame({
+    "Variable": ["Age_years", "Weight_kg", "Height_in", "BMI"],
+    "Parsed_n": [df[c].notna().sum() for c in ["Age_years", "Weight_kg", "Height_in", "BMI"]],
+    "Missing_n": [df[c].isna().sum() for c in ["Age_years", "Weight_kg", "Height_in", "BMI"]],
+    "Missing_%": [round(100 * df[c].isna().mean(), 1)
+                  for c in ["Age_years", "Weight_kg", "Height_in", "BMI"]],
+})
+
+print("\nANTHROPOMETRIC PARSING REPORT")
+display(parsing_report)
+save_table(parsing_report, "00_Parsing_Report.csv")
+
+# Show exactly which raw height strings could not be resolved, so that the
+# failures are auditable rather than hidden behind median imputation.
+unparsed = df.loc[df["Height_in"].isna(), COL_HEIGHT].dropna().unique()
+if len(unparsed) > 0:
+    print("\nUnresolved height entries (set to missing):")
+    for entry in unparsed:
+        print("  -", repr(entry))
+
+
+# =============================================================================
+# 6. MULTI-SELECT FIELD EXPANSION
+# =============================================================================
+
+def split_multiselect(value):
+    """Split a comma-separated multi-select response into cleaned tokens."""
+    if pd.isna(value):
+        return []
+    return [token.strip() for token in str(value).split(",") if token.strip()]
+
+
+symptom_lists = df[COL_SYMPTOMS].apply(split_multiselect)
+
+symptom_counts = pd.Series(
+    [token for tokens in symptom_lists for token in tokens]
+).value_counts()
+
+print("\nSYMPTOM TOKEN FREQUENCIES")
+display(symptom_counts)
+
+symptom_vocabulary = symptom_counts[symptom_counts >= MIN_SYMPTOM_FREQ].index.tolist()
+symptom_vocabulary = [s for s in symptom_vocabulary if s.lower() != "other"]
+
+print(f"\nRetained symptom features (frequency >= {MIN_SYMPTOM_FREQ}):")
+for symptom in symptom_vocabulary:
+    print("  -", symptom)
+
+
+def slugify(text):
+    return re.sub(r"[^A-Za-z0-9]+", "_", text).strip("_")
+
+
+SYMPTOM_FEATURES = []
+for symptom in symptom_vocabulary:
+    column_name = "Sym_" + slugify(symptom)
+    df[column_name] = symptom_lists.apply(lambda tokens: int(symptom in tokens))
+    SYMPTOM_FEATURES.append(column_name)
+
+df["Symptom_Count"] = symptom_lists.apply(len)
+SYMPTOM_FEATURES.append("Symptom_Count")
+
+
+# ---------------------- ordinal encoding of frequency scales -----------------
+
+def ordinal_from_multiselect(value, mapping):
+    """
+    Convert an ordered categorical response to a numeric midpoint. Some
+    respondents selected several adjacent options (for example
+    '3-5 hours, More than 5 hours'); the mean of the selected levels is used.
+    """
+    tokens = split_multiselect(value)
+    scores = [mapping[t] for t in tokens if t in mapping]
+    if not scores:
+        return np.nan
+    return float(np.mean(scores))
+
+
+SOCIAL_MEDIA_MAP = {
+    "Less than 1 hour": 0.5,
+    "1\u20133 hours": 2.0,
+    "3\u20135 hours": 4.0,
+    "More than 5 hours": 6.0,
+}
+SLEEP_MAP = {
+    "Less than 4 hours": 3.0,
+    "4\u20136 hours": 5.0,
+    "6\u20138 hours": 7.0,
+    "More than 8 hours": 9.0,
+}
+FASTFOOD_MAP = {
+    "Rarely/Never": 0.0,
+    "1\u20132 times": 1.5,
+    "3\u20134 times": 3.5,
+    "More than 4 times": 5.0,
+}
+STRESS_MAP = {"No": 0.0, "Not sure": 1.0, "Yes": 2.0}
+
+
+def _assert_mapping_covers(series, mapping, label):
+    """Fail loudly if a response option is not covered by the ordinal map."""
+    observed = set()
+    for value in series.dropna():
+        observed.update(split_multiselect(value))
+    uncovered = observed - set(mapping)
+    if uncovered:
+        print(f"WARNING [{label}]: unmapped response options -> {sorted(uncovered)}")
+        print("  These become missing. Update the mapping if the dataset changed.")
+
+
+for series, mapping, label in [
+    (df[COL_SOCIAL_HOURS], SOCIAL_MEDIA_MAP, "social media hours"),
+    (df[COL_SLEEP], SLEEP_MAP, "sleep hours"),
+    (df[COL_FASTFOOD], FASTFOOD_MAP, "fast food"),
+    (df[COL_SOCIAL_STRESS], STRESS_MAP, "social media stress"),
+]:
+    _assert_mapping_covers(series, mapping, label)
+
+df["SocialMedia_hours"] = df[COL_SOCIAL_HOURS].apply(
+    lambda v: ordinal_from_multiselect(v, SOCIAL_MEDIA_MAP))
+df["Sleep_hours"] = df[COL_SLEEP].apply(
+    lambda v: ordinal_from_multiselect(v, SLEEP_MAP))
+df["FastFood_perweek"] = df[COL_FASTFOOD].apply(
+    lambda v: ordinal_from_multiselect(v, FASTFOOD_MAP))
+df["SocialMedia_stress"] = df[COL_SOCIAL_STRESS].apply(
+    lambda v: ordinal_from_multiselect(v, STRESS_MAP))
+
+df["Family_history"] = to_binary_yes_no(df[COL_FAMILY])
+df["Supplements"] = to_binary_yes_no(df[COL_SUPPLEMENTS])
+df["Cycle_regular"] = to_binary_yes_no(df[COL_CYCLE])
+
+
+# =============================================================================
+# 7. PRE-SPECIFIED FEATURE SETS
+# =============================================================================
+#
+# SET_A excludes everything that forms part of the diagnostic criteria.
+#        This is the scientifically defensible primary analysis: it asks
+#        whether lifestyle and demographic factors carry signal about PCOS
+#        status.
+#
+# SET_B adds self-reported symptoms. Several of these (irregular periods,
+#        hirsutism, acne) are Rotterdam criteria, so SET_B measures
+#        internal consistency of self-report far more than it measures
+#        predictive capability. Report it as a secondary analysis and say so.
+#
+# Always excluded: diagnostic test undergone, laboratory result level.
+#        Both are downstream of the diagnostic process.
+
+BASE_FEATURES = [
+    "Age_years",
+    "BMI",
+    "Family_history",
+    "SocialMedia_hours",
+    "SocialMedia_stress",
+    "Sleep_hours",
+    "FastFood_perweek",
+    "Supplements",
+]
+
+CRITERION_FEATURES = ["Cycle_regular"] + SYMPTOM_FEATURES
+
+LEAKAGE_COLUMNS = [c for c in [COL_TESTS, COL_RESULTS] if c is not None]
+
+FEATURE_SETS = {
+    "SET_A_lifestyle": BASE_FEATURES,
+    "SET_B_lifestyle_plus_symptoms": BASE_FEATURES + CRITERION_FEATURES,
+}
+
+print("\nEXCLUDED AS OUTCOME LEAKAGE:")
+for column in LEAKAGE_COLUMNS:
+    print("  -", column)
+
+for name, features in FEATURE_SETS.items():
+    print(f"\n{name}: {len(features)} features")
+    print("  events per feature = %.2f" % (y.sum() / len(features)))
+
+
+# =============================================================================
+# 8. DESCRIPTIVE TABLE AND UNIVARIATE ASSOCIATIONS
+# =============================================================================
+#
+# For a survey of this size, the univariate table is arguably the primary
+# result and the machine learning section is supporting material. Both are
+# reported. P values are adjusted with Benjamini-Hochberg.
+
+CONTINUOUS_VARS = [
+    "Age_years", "BMI", "SocialMedia_hours",
+    "SocialMedia_stress", "Sleep_hours", "FastFood_perweek",
+]
+BINARY_VARS = ["Family_history", "Supplements", "Cycle_regular"] + \
+              [c for c in SYMPTOM_FEATURES if c != "Symptom_Count"]
+
+rows = []
+
+for variable in CONTINUOUS_VARS + ["Symptom_Count"]:
+    group1 = df.loc[y == 1, variable].dropna()
+    group0 = df.loc[y == 0, variable].dropna()
+    if len(group1) < 3 or len(group0) < 3:
+        continue
+    statistic, p_value = stats.mannwhitneyu(group1, group0, alternative="two-sided")
+    # Rank-biserial correlation as the effect size
+    effect = 1 - (2 * statistic) / (len(group1) * len(group0))
+    rows.append({
+        "Variable": variable,
+        "Type": "continuous",
+        "PCOS_median (IQR)": "%.1f (%.1f-%.1f)" % (
+            group1.median(), group1.quantile(.25), group1.quantile(.75)),
+        "NoPCOS_median (IQR)": "%.1f (%.1f-%.1f)" % (
+            group0.median(), group0.quantile(.25), group0.quantile(.75)),
+        "Effect_size": round(-effect, 3),
+        "Test": "Mann-Whitney U",
+        "p_value": p_value,
+    })
+
+for variable in BINARY_VARS:
+    table = pd.crosstab(df[variable], y)
+    if table.shape != (2, 2):
+        continue
+    odds_ratio, p_value = stats.fisher_exact(table.values)
+    rows.append({
+        "Variable": variable,
+        "Type": "binary",
+        "PCOS_median (IQR)": "%d/%d (%.0f%%)" % (
+            table.loc[1, 1], table[1].sum(), 100 * table.loc[1, 1] / table[1].sum()),
+        "NoPCOS_median (IQR)": "%d/%d (%.0f%%)" % (
+            table.loc[1, 0], table[0].sum(), 100 * table.loc[1, 0] / table[0].sum()),
+        "Effect_size": round(odds_ratio, 3),
+        "Test": "Fisher exact",
+        "p_value": p_value,
+    })
+
+univariate = pd.DataFrame(rows).sort_values("p_value").reset_index(drop=True)
+
+# Benjamini-Hochberg false discovery rate control
+m = len(univariate)
+univariate["rank"] = np.arange(1, m + 1)
+univariate["q_value"] = (univariate["p_value"] * m / univariate["rank"]).clip(upper=1.0)
+univariate["q_value"] = univariate["q_value"][::-1].cummin()[::-1].round(4)
+univariate["p_value"] = univariate["p_value"].round(4)
+univariate = univariate.drop(columns=["rank"])
+
+print("\nUNIVARIATE ASSOCIATIONS WITH PCOS DIAGNOSIS")
+display(univariate)
+save_table(univariate, "01_Univariate_Associations.csv")
+
+
+# ------------------------------ descriptive plots -----------------------------
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 4.5))
+
+counts = y.map({0: "No PCOS", 1: "PCOS"}).value_counts()
+axes[0].bar(counts.index, counts.values, color=["#4C72B0", "#C44E52"])
+for i, value in enumerate(counts.values):
+    axes[0].text(i, value + 0.6, str(value), ha="center")
+axes[0].set_title(f"PCOS class distribution (n = {len(y)})")
+axes[0].set_ylabel("Participants")
+
+missing = df[BASE_FEATURES + CRITERION_FEATURES].isna().mean().sort_values() * 100
+missing = missing[missing > 0]
+if len(missing) > 0:
+    axes[1].barh(missing.index, missing.values, color="#8172B2")
+    axes[1].set_xlabel("Missing (%)")
+    axes[1].set_title("Missingness after parsing")
+else:
+    axes[1].text(0.5, 0.5, "No missing values", ha="center", va="center")
+    axes[1].set_axis_off()
+
+plt.tight_layout()
+save_figure("01_Cohort_Overview.png")
+
+
+# =============================================================================
+# 9. PREPROCESSING
+# =============================================================================
+#
+# The preprocessor is constructed inside a Pipeline so that imputation and
+# scaling are fitted on training folds only. Fitting an imputer on the full
+# dataset before cross-validation leaks distributional information across
+# the split and is one of the most common sources of inflated survey-model
+# performance.
+
+def build_preprocessor(features, frame):
+    numeric_features = [
+        c for c in features
+        if pd.api.types.is_numeric_dtype(frame[c])
+    ]
+    categorical_features = [c for c in features if c not in numeric_features]
+
+    numeric_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="median", add_indicator=True)),
+        ("scaler", StandardScaler()),
+    ])
+
+    try:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:                                  # scikit-learn < 1.2
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+    categorical_pipeline = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", encoder),
+    ])
+
+    transformers = []
+    if numeric_features:
+        transformers.append(("numeric", numeric_pipeline, numeric_features))
+    if categorical_features:
+        transformers.append(("categorical", categorical_pipeline, categorical_features))
+
+    return ColumnTransformer(transformers=transformers, remainder="drop")
+
+
+# =============================================================================
+# 10. MODEL DEFINITIONS AND SEARCH SPACES
+# =============================================================================
+#
+# Hyperparameter grids are deliberately narrow and biased towards heavy
+# regularisation. With 99 observations, a deep tree ensemble has more than
+# enough capacity to memorise the training folds, and a wide grid mostly
+# searches for the seed that happens to fit the noise.
+
+def define_models():
+    models = {}
+
+    models["Majority Baseline"] = {
+        "estimator": DummyClassifier(strategy="prior", random_state=RANDOM_STATE),
+        "params": {},
+    }
+
+    models["Logistic Regression"] = {
+        "estimator": LogisticRegression(
+            max_iter=5000,
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+        ),
+        "params": {
+            "model__C": np.logspace(-3, 1, 20),
+            "model__penalty": ["l2"],
+        },
+    }
+
+    models["Elastic Net Logistic"] = {
+        "estimator": LogisticRegression(
+            max_iter=8000,
+            solver="saga",
+            penalty="elasticnet",
+            class_weight="balanced",
+            random_state=RANDOM_STATE,
+        ),
+        "params": {
+            "model__C": np.logspace(-3, 1, 15),
+            "model__l1_ratio": [0.1, 0.3, 0.5, 0.7, 0.9],
+        },
+    }
+
+    models["Random Forest"] = {
+        "estimator": RandomForestClassifier(
+            random_state=RANDOM_STATE,
+            class_weight="balanced_subsample",
+            n_jobs=-1,
+        ),
+        "params": {
+            "model__n_estimators": [300, 500],
+            "model__max_depth": [2, 3, 4, None],
+            "model__min_samples_leaf": [3, 5, 8],
+            "model__max_features": ["sqrt", 0.5],
+        },
+    }
+
+    if HAS_XGB:
+        models["XGBoost"] = {
+            "estimator": XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="logloss",
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+                # scale_pos_weight handles the mild class imbalance
+                scale_pos_weight=float((y == 0).sum() / (y == 1).sum()),
+            ),
+            "params": {
+                "model__n_estimators": [100, 200, 300],
+                "model__max_depth": [1, 2, 3],
+                "model__learning_rate": [0.01, 0.03, 0.05],
+                "model__subsample": [0.7, 0.8, 1.0],
+                "model__colsample_bytree": [0.7, 0.8, 1.0],
+                "model__min_child_weight": [3, 5, 8],
+                "model__reg_lambda": [1.0, 5.0, 10.0],
+            },
+        }
+
+    if HAS_LGB:
+        models["LightGBM"] = {
+            "estimator": LGBMClassifier(
+                objective="binary",
+                random_state=RANDOM_STATE,
+                class_weight="balanced",
+                verbosity=-1,
+                # subsample has no effect unless subsample_freq >= 1.
+                # The original script set subsample without this and the
+                # parameter was silently ignored.
+                subsample_freq=1,
+                n_jobs=-1,
+            ),
+            "params": {
+                "model__n_estimators": [100, 200, 300],
+                "model__learning_rate": [0.01, 0.03, 0.05],
+                "model__num_leaves": [3, 7, 15],
+                "model__max_depth": [2, 3, 4],
+                "model__min_child_samples": [5, 10, 15],
+                "model__subsample": [0.7, 0.8, 1.0],
+                "model__colsample_bytree": [0.7, 0.8, 1.0],
+                "model__reg_lambda": [0.0, 1.0, 5.0],
+            },
+        }
+
+    return models
+
+
+MODELS = define_models()
+
+
+# =============================================================================
+# 11. NESTED CROSS-VALIDATION
+# =============================================================================
+
+def bootstrap_auc_ci(y_true, y_score, n_boot=N_BOOTSTRAP, seed=RANDOM_STATE):
+    """Stratified bootstrap percentile confidence interval for ROC-AUC."""
+    rng = np.random.default_rng(seed)
+    y_true = np.asarray(y_true)
+    y_score = np.asarray(y_score)
+    positive_idx = np.where(y_true == 1)[0]
+    negative_idx = np.where(y_true == 0)[0]
+
+    estimates = []
+    for _ in range(n_boot):
+        sample = np.concatenate([
+            rng.choice(positive_idx, len(positive_idx), replace=True),
+            rng.choice(negative_idx, len(negative_idx), replace=True),
+        ])
+        estimates.append(roc_auc_score(y_true[sample], y_score[sample]))
+
+    return float(np.percentile(estimates, 2.5)), float(np.percentile(estimates, 97.5))
+
+
+def run_nested_cv(X, y, model_name, specification):
+    """
+    Perform nested cross-validation for one model on one feature set.
+
+    Outer loop  -> unbiased performance estimation
+    Inner loop  -> hyperparameter selection, fitted on training data only
+
+    Returns per-fold metrics, averaged out-of-fold probabilities, and the
+    per-fold permutation importances.
+    """
+    outer_cv = RepeatedStratifiedKFold(
+        n_splits=OUTER_SPLITS,
+        n_repeats=OUTER_REPEATS,
+        random_state=RANDOM_STATE,
+    )
+
+    preprocessor = build_preprocessor(list(X.columns), X)
+    base_pipeline = Pipeline([
+        ("preprocessor", preprocessor),
+        ("model", specification["estimator"]),
+    ])
+
+    # Out-of-fold probabilities are accumulated and averaged over repeats.
+    probability_sum = np.zeros(len(y))
+    probability_n = np.zeros(len(y))
+
+    fold_metrics = []
+    importance_records = []
+    selected_params = []
+
+    for fold_index, (train_idx, test_idx) in enumerate(outer_cv.split(X, y)):
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        if specification["params"]:
+            inner_cv = StratifiedKFold(
+                n_splits=INNER_SPLITS,
+                shuffle=True,
+                random_state=RANDOM_STATE + fold_index,
+            )
+            search = RandomizedSearchCV(
+                clone(base_pipeline),
+                param_distributions=specification["params"],
+                n_iter=N_SEARCH_ITER,
+                scoring="roc_auc",
+                cv=inner_cv,
+                random_state=RANDOM_STATE + fold_index,
+                n_jobs=-1,
+                refit=True,
+            )
+            search.fit(X_train, y_train)
+            fitted = search.best_estimator_
+            selected_params.append(search.best_params_)
+        else:
+            fitted = clone(base_pipeline).fit(X_train, y_train)
+
+        probabilities = fitted.predict_proba(X_test)[:, 1]
+        predictions = (probabilities >= 0.5).astype(int)
+
+        probability_sum[test_idx] += probabilities
+        probability_n[test_idx] += 1
+
+        # A fold containing a single class cannot yield ROC-AUC.
+        auc = (roc_auc_score(y_test, probabilities)
+               if len(np.unique(y_test)) > 1 else np.nan)
+
+        fold_metrics.append({
+            "fold": fold_index,
+            "accuracy": accuracy_score(y_test, predictions),
+            "balanced_accuracy": balanced_accuracy_score(y_test, predictions),
+            "sensitivity": recall_score(y_test, predictions, zero_division=0),
+            "specificity": recall_score(y_test, predictions, pos_label=0, zero_division=0),
+            "precision": precision_score(y_test, predictions, zero_division=0),
+            "f1": f1_score(y_test, predictions, zero_division=0),
+            "roc_auc": auc,
+            "pr_auc": average_precision_score(y_test, probabilities),
+            "brier": brier_score_loss(y_test, probabilities),
+        })
+
+        # Permutation importance on held-out data. This is model agnostic and,
+        # unlike impurity-based importance, is not biased towards
+        # high-cardinality features.
+        if model_name != "Majority Baseline":
+            try:
+                perm = permutation_importance(
+                    fitted, X_test, y_test,
+                    scoring="roc_auc",
+                    n_repeats=10,
+                    random_state=RANDOM_STATE,
+                    n_jobs=-1,
+                )
+                for feature, importance in zip(X.columns, perm.importances_mean):
+                    importance_records.append(
+                        {"Feature": feature, "Importance": importance})
+            except Exception as error:
+                print(f"    permutation importance failed on fold {fold_index}: {error}")
+
+    with np.errstate(invalid="ignore"):
+        oof_probability = np.divide(
+            probability_sum, probability_n,
+            out=np.full(len(y), np.nan), where=probability_n > 0,
+        )
+
+    return (pd.DataFrame(fold_metrics),
+            oof_probability,
+            pd.DataFrame(importance_records),
+            selected_params)
+
+
+def summarise_folds(fold_df, model_name):
+    """Mean, standard deviation, and 95% interval across outer folds."""
+    summary = {"Model": model_name}
+    for metric in ["accuracy", "balanced_accuracy", "sensitivity", "specificity",
+                   "precision", "f1", "roc_auc", "pr_auc", "brier"]:
+        values = fold_df[metric].dropna()
+        summary[metric] = values.mean()
+        summary[f"{metric}_SD"] = values.std(ddof=1)
+        if len(values) > 1:
+            interval = stats.t.interval(
+                0.95, len(values) - 1,
+                loc=values.mean(),
+                scale=stats.sem(values),
+            )
+            summary[f"{metric}_CI"] = "[%.3f, %.3f]" % interval
+        else:
+            summary[f"{metric}_CI"] = "n/a"
+    return summary
+
+
+# ------------------------------ execute --------------------------------------
+
+all_results = {}
+
+for set_name, features in FEATURE_SETS.items():
+
+    print("\n" + "=" * 78)
+    print(f"FEATURE SET: {set_name}  ({len(features)} features)")
+    print("=" * 78)
+
+    X = df[features].copy()
+
+    # Drop any feature that is constant or almost entirely missing, since
+    # neither contributes information and both destabilise the search.
+    drop = [c for c in X.columns
+            if X[c].nunique(dropna=True) <= 1 or X[c].isna().mean() > 0.5]
+    if drop:
+        print("Dropping uninformative features:", drop)
+        X = X.drop(columns=drop)
+
+    set_results = {}
+
+    for model_name, specification in MODELS.items():
+        print(f"\n  Running nested CV: {model_name}")
+        fold_df, oof_probability, importance_df, params = run_nested_cv(
+            X, y, model_name, specification)
+
+        set_results[model_name] = {
+            "folds": fold_df,
+            "oof": oof_probability,
+            "importance": importance_df,
+            "params": params,
+        }
+        print("    outer ROC-AUC = %.3f (SD %.3f)"
+              % (fold_df["roc_auc"].mean(), fold_df["roc_auc"].std(ddof=1)))
+
+    all_results[set_name] = {"X": X, "results": set_results}
+
+
+# =============================================================================
+# 12. PERFORMANCE TABLES
+# =============================================================================
+
+for set_name, payload in all_results.items():
+
+    summary_rows = [summarise_folds(v["folds"], k)
+                    for k, v in payload["results"].items()]
+    summary_df = pd.DataFrame(summary_rows).sort_values("roc_auc", ascending=False)
+
+    # Pooled out-of-fold AUC with a bootstrap interval, reported alongside the
+    # fold-averaged value. The two answer different questions and should not
+    # be conflated.
+    pooled_rows = []
+    for model_name, values in payload["results"].items():
+        probability = values["oof"]
+        mask = ~np.isnan(probability)
+        if len(np.unique(y[mask])) < 2:
+            continue
+        auc = roc_auc_score(y[mask], probability[mask])
+        low, high = bootstrap_auc_ci(y[mask], probability[mask])
+        pooled_rows.append({
+            "Model": model_name,
+            "Pooled_OOF_ROC_AUC": round(auc, 3),
+            "Bootstrap_95CI": "[%.3f, %.3f]" % (low, high),
+            "Pooled_OOF_PR_AUC": round(
+                average_precision_score(y[mask], probability[mask]), 3),
+            "Brier": round(brier_score_loss(y[mask], probability[mask]), 3),
+        })
+
+    pooled_df = pd.DataFrame(pooled_rows).sort_values(
+        "Pooled_OOF_ROC_AUC", ascending=False)
+
+    print("\n" + "=" * 78)
+    print(f"PERFORMANCE — {set_name}")
+    print("=" * 78)
+    print("\nFold-averaged (nested CV, mean over %d outer folds):"
+          % (OUTER_SPLITS * OUTER_REPEATS))
+    display(summary_df[[
+        "Model", "roc_auc", "roc_auc_CI", "pr_auc",
+        "balanced_accuracy", "sensitivity", "specificity", "brier",
+    ]].round(3))
+
+    print("\nPooled out-of-fold with bootstrap interval:")
+    display(pooled_df)
+
+    save_table(summary_df.round(4), f"02_Performance_{set_name}.csv")
+    save_table(pooled_df, f"03_Pooled_OOF_{set_name}.csv")
+
+    payload["summary"] = summary_df
+    payload["pooled"] = pooled_df
+
+
+# ----------------- paired comparison against logistic regression -------------
+#
+# Fold-level scores from repeated CV are correlated, so the Wilcoxon p value
+# below is anti-conservative. It is reported as a rough ordering aid only and
+# should be described as such in any manuscript.
+
+comparison_rows = []
+for set_name, payload in all_results.items():
+    reference = payload["results"].get("Logistic Regression")
+    if reference is None:
+        continue
+    reference_auc = reference["folds"]["roc_auc"].values
+
+    for model_name, values in payload["results"].items():
+        if model_name in ("Logistic Regression", "Majority Baseline"):
+            continue
+        candidate_auc = values["folds"]["roc_auc"].values
+        mask = ~(np.isnan(reference_auc) | np.isnan(candidate_auc))
+        if mask.sum() < 5:
+            continue
+        try:
+            _, p_value = stats.wilcoxon(candidate_auc[mask], reference_auc[mask])
+        except ValueError:
+            p_value = np.nan
+        comparison_rows.append({
+            "Feature_Set": set_name,
+            "Model": model_name,
+            "Mean_AUC_difference_vs_LR": round(
+                np.nanmean(candidate_auc - reference_auc), 4),
+            "Wilcoxon_p_uncorrected": round(p_value, 4) if p_value == p_value else np.nan,
+        })
+
+if comparison_rows:
+    comparison_df = pd.DataFrame(comparison_rows)
+    print("\nPAIRED FOLD-LEVEL COMPARISON AGAINST LOGISTIC REGRESSION")
+    print("(p values are anti-conservative under repeated CV; indicative only)")
+    display(comparison_df)
+    save_table(comparison_df, "04_Model_Comparison_vs_LR.csv")
+
+
+# =============================================================================
+# 13. DIAGNOSTIC PLOTS
+# =============================================================================
+
+for set_name, payload in all_results.items():
+
+    results = payload["results"]
+    plot_models = [m for m in results if m != "Majority Baseline"]
+
+    fig, axes = plt.subplots(1, 3, figsize=(17, 5))
+
+    # ---- ROC ----
+    for model_name in plot_models:
+        probability = results[model_name]["oof"]
+        mask = ~np.isnan(probability)
+        fpr, tpr, _ = roc_curve(y[mask], probability[mask])
+        auc = roc_auc_score(y[mask], probability[mask])
+        axes[0].plot(fpr, tpr, lw=2, label=f"{model_name} ({auc:.3f})")
+    axes[0].plot([0, 1], [0, 1], "k--", lw=1)
+    axes[0].set_xlabel("False positive rate")
+    axes[0].set_ylabel("True positive rate")
+    axes[0].set_title("ROC — averaged out-of-fold")
+    axes[0].legend(fontsize=8, loc="lower right")
+
+    # ---- Precision-recall ----
+    for model_name in plot_models:
+        probability = results[model_name]["oof"]
+        mask = ~np.isnan(probability)
+        precision, recall, _ = precision_recall_curve(y[mask], probability[mask])
+        ap = average_precision_score(y[mask], probability[mask])
+        axes[1].plot(recall, precision, lw=2, label=f"{model_name} ({ap:.3f})")
+    axes[1].axhline(y.mean(), ls="--", c="k", lw=1, label=f"Prevalence ({y.mean():.2f})")
+    axes[1].set_xlabel("Recall")
+    axes[1].set_ylabel("Precision")
+    axes[1].set_title("Precision-recall")
+    axes[1].legend(fontsize=8, loc="lower left")
+
+    # ---- Calibration ----
+    for model_name in plot_models:
+        probability = results[model_name]["oof"]
+        mask = ~np.isnan(probability)
+        try:
+            observed, predicted = calibration_curve(
+                y[mask], probability[mask], n_bins=4, strategy="quantile")
+            axes[2].plot(predicted, observed, "o-", lw=2, label=model_name)
+        except Exception:
+            continue
+    axes[2].plot([0, 1], [0, 1], "k--", lw=1)
+    axes[2].set_xlabel("Mean predicted probability")
+    axes[2].set_ylabel("Observed frequency")
+    axes[2].set_title("Calibration (4 bins; wide bins reflect small n)")
+    axes[2].legend(fontsize=8)
+
+    fig.suptitle(f"Model diagnostics — {set_name}", fontsize=14)
+    plt.tight_layout()
+    save_figure(f"02_Diagnostics_{set_name}.png")
+
+
+# ------------------------- ROC-AUC distribution across folds ------------------
+
+fig, axes = plt.subplots(1, len(all_results), figsize=(7 * len(all_results), 5),
+                         squeeze=False)
+
+for ax, (set_name, payload) in zip(axes[0], all_results.items()):
+    records = []
+    for model_name, values in payload["results"].items():
+        if model_name == "Majority Baseline":
+            continue
+        for auc in values["folds"]["roc_auc"].dropna():
+            records.append({"Model": model_name, "ROC-AUC": auc})
+    fold_df = pd.DataFrame(records)
+    sns.boxplot(data=fold_df, x="Model", y="ROC-AUC", ax=ax)
+    sns.stripplot(data=fold_df, x="Model", y="ROC-AUC", ax=ax,
+                  color="black", size=3, alpha=0.4)
+    ax.axhline(0.5, ls="--", c="red", lw=1)
+    ax.set_title(set_name)
+    ax.set_ylim(0, 1)
+    ax.tick_params(axis="x", rotation=30)
+
+plt.suptitle("Outer-fold ROC-AUC distribution\n"
+             "Overlapping boxes indicate the models are not distinguishable",
+             fontsize=13)
+plt.tight_layout()
+save_figure("03_Fold_AUC_Distribution.png")
+
+
+# ----------------------------- confusion matrices ----------------------------
+
+for set_name, payload in all_results.items():
+    best_model_name = payload["pooled"].iloc[0]["Model"]
+    probability = payload["results"][best_model_name]["oof"]
+    mask = ~np.isnan(probability)
+    predictions = (probability[mask] >= 0.5).astype(int)
+
+    cm = confusion_matrix(y[mask], predictions)
+
+    plt.figure(figsize=(5.5, 4.5))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False,
+                xticklabels=["No PCOS", "PCOS"],
+                yticklabels=["No PCOS", "PCOS"])
+    plt.xlabel("Predicted")
+    plt.ylabel("Observed")
+    plt.title(f"{best_model_name} — {set_name}\n(out-of-fold, threshold 0.50)")
+    plt.tight_layout()
+    save_figure(f"04_Confusion_{set_name}.png")
+
+
+# =============================================================================
+# 14. PERMUTATION IMPORTANCE
+# =============================================================================
+#
+# Permutation importance is computed on held-out outer-fold data and then
+# averaged. It is preferred over impurity-based importance because the latter
+# inflates the apparent importance of continuous and high-cardinality
+# variables. The standard deviation column matters more than the mean here:
+# a feature whose importance swings sign across folds is not a finding.
+
+for set_name, payload in all_results.items():
+    best_model_name = payload["pooled"].iloc[0]["Model"]
+    importance_df = payload["results"][best_model_name]["importance"]
+
+    if importance_df.empty:
+        continue
+
+    aggregated = (importance_df
+                  .groupby("Feature")["Importance"]
+                  .agg(["mean", "std", "count"])
+                  .reset_index()
+                  .rename(columns={"mean": "Mean_Importance",
+                                   "std": "SD_Importance",
+                                   "count": "Folds"})
+                  .sort_values("Mean_Importance", ascending=False))
+
+    aggregated["Sign_stable"] = (
+        aggregated["Mean_Importance"].abs() > aggregated["SD_Importance"])
+
+    print(f"\nPERMUTATION IMPORTANCE — {best_model_name} — {set_name}")
+    display(aggregated.round(4))
+    save_table(aggregated.round(5), f"05_Permutation_Importance_{set_name}.csv")
+
+    top = aggregated.head(15).sort_values("Mean_Importance")
+    plt.figure(figsize=(9, max(4, 0.4 * len(top))))
+    plt.barh(top["Feature"], top["Mean_Importance"],
+             xerr=top["SD_Importance"], color="#4C72B0",
+             error_kw={"ecolor": "gray", "lw": 1})
+    plt.axvline(0, c="k", lw=1)
+    plt.xlabel("Mean drop in ROC-AUC when permuted")
+    plt.title(f"Permutation importance — {best_model_name}\n{set_name}")
+    plt.tight_layout()
+    save_figure(f"05_Permutation_Importance_{set_name}.png")
+
+
+# =============================================================================
+# 15. SHAP INTERPRETABILITY
+# =============================================================================
+#
+# The SHAP model is refitted on the complete dataset. This is standard
+# practice for explanation but it means the SHAP values describe the fitted
+# model, not out-of-sample behaviour. With n = 99 the ordering of mid-ranked
+# features is unstable; only the top two or three should be discussed, and
+# the permutation importance table above is the more defensible evidence.
+
+def extract_feature_names(fitted_preprocessor):
+    try:
+        names = fitted_preprocessor.get_feature_names_out()
+    except Exception:
+        names = np.array([f"f{i}" for i in range(
+            fitted_preprocessor.transform(np.zeros((1, 1))).shape[1])])
+    return [re.sub(r"^(numeric|categorical|remainder)__", "", n) for n in names]
+
+
+def normalise_shap_output(shap_output):
+    """
+    Reduce SHAP output to a two-dimensional array for the positive class.
+
+    Different explainer and model combinations return different shapes:
+      (n, p)          binary XGBoost / LightGBM
+      (n, p, 2)       RandomForestClassifier under recent SHAP versions
+      list of two     older SHAP versions
+    The original script did not handle the three-dimensional case and would
+    raise or silently plot the wrong class when Random Forest was selected.
+    """
+    values = shap_output.values if hasattr(shap_output, "values") else shap_output
+
+    if isinstance(values, list):
+        values = values[1] if len(values) == 2 else values[0]
+
+    values = np.asarray(values)
+    if values.ndim == 3:
+        values = values[:, :, 1] if values.shape[2] == 2 else values[:, :, 0]
+
+    return values
+
+
+if HAS_SHAP:
+    for set_name, payload in all_results.items():
+
+        X_set = payload["X"]
+        best_model_name = payload["pooled"].iloc[0]["Model"]
+
+        if best_model_name == "Majority Baseline":
+            print(f"\n{set_name}: baseline ranked first. No model to explain.")
+            print("This is itself the result: the features carry little signal.")
+            continue
+
+        specification = MODELS[best_model_name]
+
+        # Refit on the full dataset using an inner search, so that the
+        # explained model is at least tuned in a comparable way.
+        preprocessor = build_preprocessor(list(X_set.columns), X_set)
+        pipeline = Pipeline([
+            ("preprocessor", preprocessor),
+            ("model", specification["estimator"]),
+        ])
+
+        if specification["params"]:
+            search = RandomizedSearchCV(
+                pipeline,
+                param_distributions=specification["params"],
+                n_iter=N_SEARCH_ITER,
+                scoring="roc_auc",
+                cv=StratifiedKFold(5, shuffle=True, random_state=RANDOM_STATE),
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+            )
+            search.fit(X_set, y)
+            final_model = search.best_estimator_
+            print(f"\n{set_name} — final {best_model_name} parameters:")
+            print(json.dumps({k: str(v) for k, v in search.best_params_.items()},
+                             indent=2))
+        else:
+            final_model = pipeline.fit(X_set, y)
+
+        if HAS_JOBLIB:
+            joblib.dump(final_model, os.path.join(
+                MODEL_DIR, f"final_{slugify(best_model_name)}_{set_name}.joblib"))
+
+        fitted_preprocessor = final_model.named_steps["preprocessor"]
+        fitted_estimator = final_model.named_steps["model"]
+
+        X_transformed = fitted_preprocessor.transform(X_set)
+        feature_names = extract_feature_names(fitted_preprocessor)
+        X_shap = pd.DataFrame(X_transformed, columns=feature_names)
+
+        try:
+            if isinstance(fitted_estimator, LogisticRegression):
+                explainer = shap.LinearExplainer(fitted_estimator, X_shap)
+            else:
+                explainer = shap.TreeExplainer(fitted_estimator)
+
+            shap_values = normalise_shap_output(explainer(X_shap))
+
+            # ---- beeswarm ----
+            plt.figure()
+            shap.summary_plot(shap_values, X_shap, show=False, max_display=15)
+            plt.title(f"SHAP — {best_model_name} — {set_name}", fontsize=13)
+            plt.tight_layout()
+            save_figure(f"06_SHAP_Beeswarm_{set_name}.png")
+
+            # ---- bar ----
+            plt.figure()
+            shap.summary_plot(shap_values, X_shap, plot_type="bar",
+                              show=False, max_display=15)
+            plt.title(f"Mean |SHAP| — {set_name}", fontsize=13)
+            plt.tight_layout()
+            save_figure(f"07_SHAP_Bar_{set_name}.png")
+
+            shap_importance = pd.DataFrame({
+                "Feature": feature_names,
+                "Mean_Absolute_SHAP": np.abs(shap_values).mean(axis=0),
+            }).sort_values("Mean_Absolute_SHAP", ascending=False)
+
+            print(f"\nSHAP IMPORTANCE — {set_name}")
+            display(shap_importance.head(15).round(4))
+            save_table(shap_importance.round(5), f"06_SHAP_Importance_{set_name}.csv")
+
+        except Exception as error:
+            print(f"SHAP failed for {best_model_name} on {set_name}: {error}")
+
+
+# =============================================================================
+# 16. LINEAR PROBABILITY MODEL BASELINE
+# =============================================================================
+#
+# Retained because it was requested. Ordinary least squares on a binary
+# outcome is a linear probability model: it can predict outside [0, 1], its
+# errors are heteroscedastic by construction, and R-squared against a binary
+# outcome is not interpretable as explained variance in the usual sense. It
+# is reported as a sanity check on whether a strictly linear, unregularised
+# fit recovers comparable discrimination, not as a competing model.
+
+lpm_rows = []
+
+for set_name, payload in all_results.items():
+
+    X_set = payload["X"]
+    cv = StratifiedKFold(OUTER_SPLITS, shuffle=True, random_state=RANDOM_STATE)
+    predicted = np.zeros(len(y))
+
+    for train_idx, test_idx in cv.split(X_set, y):
+        preprocessor = build_preprocessor(list(X_set.columns), X_set)
+        lpm = Pipeline([("preprocessor", preprocessor), ("model", LinearRegression())])
+        lpm.fit(X_set.iloc[train_idx], y.iloc[train_idx])
+        predicted[test_idx] = lpm.predict(X_set.iloc[test_idx])
+
+    n_out_of_range = int(((predicted < 0) | (predicted > 1)).sum())
+    clipped = np.clip(predicted, 0, 1)
+    labels = (clipped >= 0.5).astype(int)
+
+    lpm_rows.append({
+        "Feature_Set": set_name,
+        "Accuracy": round(accuracy_score(y, labels), 3),
+        "Balanced_Accuracy": round(balanced_accuracy_score(y, labels), 3),
+        "Sensitivity": round(recall_score(y, labels, zero_division=0), 3),
+        "Specificity": round(recall_score(y, labels, pos_label=0, zero_division=0), 3),
+        "ROC_AUC": round(roc_auc_score(y, clipped), 3),
+        "RMSE": round(np.sqrt(mean_squared_error(y, clipped)), 3),
+        "MAE": round(mean_absolute_error(y, clipped), 3),
+        "R2_not_interpretable": round(r2_score(y, clipped), 3),
+        "Predictions_outside_0_1": n_out_of_range,
+    })
+
+lpm_df = pd.DataFrame(lpm_rows)
+print("\nLINEAR PROBABILITY MODEL BASELINE (exploratory only)")
+display(lpm_df)
+save_table(lpm_df, "07_Linear_Probability_Baseline.csv")
+
+
+# =============================================================================
+# 17. EXPORTS AND RUN SUMMARY
+# =============================================================================
+
+oof_export = pd.DataFrame({"Observed_PCOS": y.values})
+for set_name, payload in all_results.items():
+    for model_name, values in payload["results"].items():
+        column = f"{slugify(set_name)}__{slugify(model_name)}__prob"
+        oof_export[column] = values["oof"]
+save_table(oof_export, "08_Out_of_Fold_Probabilities.csv")
+
+analysis_columns = (
+    ["PCOS", "Age_years", "Weight_kg", "Height_in", "BMI"]
+    + BASE_FEATURES + CRITERION_FEATURES
+)
+analysis_columns = list(dict.fromkeys([c for c in analysis_columns if c in df.columns]))
+save_table(df[analysis_columns], "09_Analysis_Dataset.csv")
+
+summary = {
+    "Run_timestamp": datetime.now().isoformat(timespec="seconds"),
+    "Participants": int(len(df)),
+    "PCOS_cases": int(y.sum()),
+    "Non_PCOS_cases": int((y == 0).sum()),
+    "Prevalence": round(float(y.mean()), 3),
+    "Majority_class_accuracy": round(float(MAJORITY_BASELINE), 3),
+    "Validation": (f"Nested CV — outer {OUTER_SPLITS}x{OUTER_REPEATS} repeated "
+                   f"stratified, inner {INNER_SPLITS}-fold for tuning"),
+    "Excluded_leakage_columns": "; ".join(LEAKAGE_COLUMNS),
+    "Criterion_features_flagged": "; ".join(CRITERION_FEATURES),
+    "BMI_available_n": int(df["BMI"].notna().sum()),
+}
+
+for set_name, payload in all_results.items():
+    top = payload["pooled"].iloc[0]
+    summary[f"{set_name}__best_model"] = top["Model"]
+    summary[f"{set_name}__pooled_AUC"] = top["Pooled_OOF_ROC_AUC"]
+    summary[f"{set_name}__AUC_95CI"] = top["Bootstrap_95CI"]
+
+summary_df = pd.DataFrame(list(summary.items()), columns=["Parameter", "Value"])
+save_table(summary_df, "10_Run_Summary.csv")
+
+print("\n" + "=" * 78)
+print("ANALYSIS COMPLETE")
+print("=" * 78)
+display(summary_df)
+
+print("\nInterpretation guidance:")
+print("  - Report the SET_A result as the primary analysis. SET_B contains")
+print("    Rotterdam criterion variables and measures self-report consistency.")
+print("  - Report ROC-AUC with the bootstrap interval. If the interval")
+print("    includes 0.5, the model does not discriminate.")
+print("  - If the boxplots in 03_Fold_AUC_Distribution.png overlap heavily,")
+print("    state that the model families were statistically indistinguishable")
+print("    rather than declaring a winner.")
+print("  - The outcome is self-reported diagnosis without clinical")
+print("    confirmation. This belongs in the limitations section.")
+print(f"\nOutputs written to: {RESULT_DIR}")

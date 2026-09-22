@@ -101,16 +101,3 @@ Place the survey workbook in `data/` before running.
 - Expect overlapping performance across model families. If penalised
   logistic regression matches gradient boosting, that is a finding, not a
   failure.
-
-## Citation
-
-If you use this code, please cite the accompanying paper:
-
-```
-<Author list>. <Paper title>. In: Proceedings of ICEAI 2026.
-```
-<!-- Replace with the full reference once published. -->
-
-## License
-
-<!-- Add a license, e.g. MIT, and include a LICENSE file. -->

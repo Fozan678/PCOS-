@@ -1,6 +1,69 @@
+"""
+PCOS prediction from survey data: refined analysis pipeline
+============================================================
+
+Exploratory machine learning analysis of a short online questionnaire on
+polycystic ovary syndrome (PCOS).
+
+Dataset: n = 99 respondents, 14 raw columns.
+Target:  "Have you been medically diagnosed with PCOS?" -> 40 Yes / 59 No.
+
+Usage
+-----
+    python pcos_pipeline.py --data data/pcos_survey.xlsx --out results
+
+Both paths can also be set with the environment variables PCOS_DATA and
+PCOS_RESULTS. The script also runs cell by cell in Jupyter.
+
+Read this before interpreting any output
+----------------------------------------
+With 99 respondents and 40 positive cases, this dataset supports an
+exploratory, descriptive analysis. It does not support a claim that a tuned
+gradient boosting model is a validated PCOS screening tool. The
+events-per-predictor ratio is approximately 4 at best, well below the ~10-20
+conventionally required for stable model estimation. Every performance number
+is reported with an uncertainty interval, and model families are compared
+against each other, against logistic regression, and against a
+majority-class baseline.
+
+Corrections relative to the original script
+-------------------------------------------
+1. Criterion leakage. Menstrual cycle regularity, irregular periods, acne,
+   and facial/body hair growth are components of the Rotterdam diagnostic
+   criteria. Two pre-specified feature sets are therefore run and reported:
+   SET_A (lifestyle and demographic only) and SET_B (SET_A plus
+   self-reported symptoms).
+2. Optimistic tuning bias. Hyperparameters are selected with nested
+   cross-validation, so tuning happens inside the training portion only.
+3. Height and weight parsing. Heights such as "5'4", "5 feet 3 inches",
+   5.4 (five feet four inches), "158 cm", "5.1 inches", "5,2\"",
+   "5/2 or 5/3", and "4.4 ft", and weights such as "58 kg" and "40kg", are
+   parsed explicitly instead of becoming missing and being median-imputed.
+4. Symptom information. The multi-select symptom field is expanded into
+   binary indicators rather than collapsed to a count.
+
+The diagnostic test column and the test results column are excluded as
+outcome leakage. The test column is missing for 31 respondents, and that
+missingness is itself informative, so imputing it would import the outcome
+into the model.
+
+Data availability
+-----------------
+The survey workbook contains respondents' health information and is not
+distributed with this repository. Outputs in the results directory include
+row-level data (out-of-fold probabilities and the analysis dataset) and must
+not be committed.
+"""
+
+# =============================================================================
+# 1. IMPORTS AND CONFIGURATION
+# =============================================================================
+
 import os
 import re
+import sys
 import json
+import argparse
 import warnings
 from datetime import datetime
 
@@ -8,7 +71,14 @@ warnings.filterwarnings("ignore")
 
 import numpy as np
 import pandas as pd
+
+# Use a non-interactive backend when running as a script, so that the run
+# does not block on figure windows or fail on a headless machine.
+IN_NOTEBOOK = "ipykernel" in sys.modules
+
 import matplotlib
+if not IN_NOTEBOOK:
+    matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import seaborn as sns
 
@@ -76,9 +146,30 @@ except ImportError:
     HAS_JOBLIB = False
 
 
-# ----------------------------- CONFIGURATION ---------------------------------
+def parse_arguments():
+    """
+    Read input and output paths from the command line or the environment.
+    parse_known_args() ignores the extra arguments Jupyter passes, so the
+    same code works in a notebook.
+    """
+    parser = argparse.ArgumentParser(
+        description="PCOS survey analysis with nested cross-validation.")
+    parser.add_argument(
+        "--data",
+        default=os.environ.get("PCOS_DATA", os.path.join("data", "pcos_survey.xlsx")),
+        help="Path to the survey workbook (.xlsx).",
+    )
+    parser.add_argument(
+        "--out",
+        default=os.environ.get("PCOS_RESULTS", "results"),
+        help="Directory for tables, figures, and models.",
+    )
+    arguments, _ = parser.parse_known_args()
+    return arguments
 
-FILE_PATH = "PCOS data response (1)(1).xlsx"   # adjust to the local path
+
+ARGS = parse_arguments()
+FILE_PATH = ARGS.data
 
 RANDOM_STATE = 42
 
@@ -122,8 +213,7 @@ except NameError:
 # 2. OUTPUT DIRECTORIES
 # =============================================================================
 
-HOME_DIR = os.getcwd()
-RESULT_DIR = os.path.join(HOME_DIR, "PCOS_AI_Results")
+RESULT_DIR = os.path.abspath(ARGS.out)
 FIG_DIR = os.path.join(RESULT_DIR, "Figures")
 MODEL_DIR = os.path.join(RESULT_DIR, "Models")
 TABLE_DIR = os.path.join(RESULT_DIR, "Tables")
@@ -131,14 +221,15 @@ TABLE_DIR = os.path.join(RESULT_DIR, "Tables")
 for directory in (RESULT_DIR, FIG_DIR, MODEL_DIR, TABLE_DIR):
     os.makedirs(directory, exist_ok=True)
 
-print("Working directory :", HOME_DIR)
+print("Input workbook    :", os.path.abspath(FILE_PATH))
 print("Results directory :", RESULT_DIR)
 
 
 def save_figure(filename):
     """Save the current figure to the figures directory and close it."""
     plt.savefig(os.path.join(FIG_DIR, filename), dpi=300, bbox_inches="tight")
-    plt.show()
+    if IN_NOTEBOOK:
+        plt.show()
     plt.close()
 
 
@@ -151,6 +242,12 @@ def save_table(dataframe, filename):
 # =============================================================================
 # 3. LOAD DATA AND NORMALISE COLUMN NAMES
 # =============================================================================
+
+if not os.path.isfile(FILE_PATH):
+    raise FileNotFoundError(
+        f"Survey workbook not found at '{FILE_PATH}'. Place it in data/ or "
+        "pass its location with --data (or the PCOS_DATA environment variable)."
+    )
 
 df_raw = pd.read_excel(FILE_PATH)
 print("\nRaw shape:", df_raw.shape)
@@ -183,10 +280,9 @@ def find_column(df, *keywords, required=True):
             'sleep' does not match 'sleeping'
     Pass 3  plain substring match, as a last resort
 
-    Pass 2 is what the previous version was missing: a bare substring test
-    binds 'age' to 'Age', 'On average, how many hours ... social media' and
-    'On average, how many hours do you sleep', which is a genuine ambiguity
-    rather than a bug in the header cleaning.
+    A bare substring test would bind 'age' to 'Age', 'On average, how many
+    hours ... social media' and 'On average, how many hours do you sleep',
+    which is a genuine ambiguity rather than a bug in the header cleaning.
     """
     lowered = [k.lower() for k in keywords]
     joined = " ".join(lowered)
@@ -543,7 +639,7 @@ STRESS_MAP = {"No": 0.0, "Not sure": 1.0, "Yes": 2.0}
 
 
 def _assert_mapping_covers(series, mapping, label):
-    """Fail loudly if a response option is not covered by the ordinal map."""
+    """Warn loudly if a response option is not covered by the ordinal map."""
     observed = set()
     for value in series.dropna():
         observed.update(split_multiselect(value))
@@ -580,14 +676,13 @@ df["Cycle_regular"] = to_binary_yes_no(df[COL_CYCLE])
 # =============================================================================
 #
 # SET_A excludes everything that forms part of the diagnostic criteria.
-#        This is the scientifically defensible primary analysis: it asks
-#        whether lifestyle and demographic factors carry signal about PCOS
-#        status.
+#        This is the primary analysis: it asks whether lifestyle and
+#        demographic factors carry signal about PCOS status.
 #
 # SET_B adds self-reported symptoms. Several of these (irregular periods,
 #        hirsutism, acne) are Rotterdam criteria, so SET_B measures
 #        internal consistency of self-report far more than it measures
-#        predictive capability. Report it as a secondary analysis and say so.
+#        predictive capability. It is a secondary analysis.
 #
 # Always excluded: diagnostic test undergone, laboratory result level.
 #        Both are downstream of the diagnostic process.
@@ -722,8 +817,7 @@ save_figure("01_Cohort_Overview.png")
 # The preprocessor is constructed inside a Pipeline so that imputation and
 # scaling are fitted on training folds only. Fitting an imputer on the full
 # dataset before cross-validation leaks distributional information across
-# the split and is one of the most common sources of inflated survey-model
-# performance.
+# the split.
 
 def build_preprocessor(features, frame):
     numeric_features = [
@@ -842,8 +936,6 @@ def define_models():
                 class_weight="balanced",
                 verbosity=-1,
                 # subsample has no effect unless subsample_freq >= 1.
-                # The original script set subsample without this and the
-                # parameter was silently ignored.
                 subsample_freq=1,
                 n_jobs=-1,
             ),
@@ -1112,8 +1204,7 @@ for set_name, payload in all_results.items():
 # ----------------- paired comparison against logistic regression -------------
 #
 # Fold-level scores from repeated CV are correlated, so the Wilcoxon p value
-# below is anti-conservative. It is reported as a rough ordering aid only and
-# should be described as such in any manuscript.
+# below is anti-conservative. It is reported as a rough ordering aid only.
 
 comparison_rows = []
 for set_name, payload in all_results.items():
@@ -1261,9 +1352,7 @@ for set_name, payload in all_results.items():
 # =============================================================================
 #
 # Permutation importance is computed on held-out outer-fold data and then
-# averaged. It is preferred over impurity-based importance because the latter
-# inflates the apparent importance of continuous and high-cardinality
-# variables. The standard deviation column matters more than the mean here:
+# averaged. The standard deviation column matters more than the mean here:
 # a feature whose importance swings sign across folds is not a finding.
 
 for set_name, payload in all_results.items():
@@ -1311,12 +1400,12 @@ for set_name, payload in all_results.items():
 # features is unstable; only the top two or three should be discussed, and
 # the permutation importance table above is the more defensible evidence.
 
-def extract_feature_names(fitted_preprocessor):
+def extract_feature_names(fitted_preprocessor, n_columns):
+    """Return clean output feature names, with a generic fallback."""
     try:
         names = fitted_preprocessor.get_feature_names_out()
     except Exception:
-        names = np.array([f"f{i}" for i in range(
-            fitted_preprocessor.transform(np.zeros((1, 1))).shape[1])])
+        names = np.array([f"f{i}" for i in range(n_columns)])
     return [re.sub(r"^(numeric|categorical|remainder)__", "", n) for n in names]
 
 
@@ -1328,8 +1417,6 @@ def normalise_shap_output(shap_output):
       (n, p)          binary XGBoost / LightGBM
       (n, p, 2)       RandomForestClassifier under recent SHAP versions
       list of two     older SHAP versions
-    The original script did not handle the three-dimensional case and would
-    raise or silently plot the wrong class when Random Forest was selected.
     """
     values = shap_output.values if hasattr(shap_output, "values") else shap_output
 
@@ -1357,7 +1444,7 @@ if HAS_SHAP:
         specification = MODELS[best_model_name]
 
         # Refit on the full dataset using an inner search, so that the
-        # explained model is at least tuned in a comparable way.
+        # explained model is tuned in a comparable way.
         preprocessor = build_preprocessor(list(X_set.columns), X_set)
         pipeline = Pipeline([
             ("preprocessor", preprocessor),
@@ -1390,7 +1477,7 @@ if HAS_SHAP:
         fitted_estimator = final_model.named_steps["model"]
 
         X_transformed = fitted_preprocessor.transform(X_set)
-        feature_names = extract_feature_names(fitted_preprocessor)
+        feature_names = extract_feature_names(fitted_preprocessor, X_transformed.shape[1])
         X_shap = pd.DataFrame(X_transformed, columns=feature_names)
 
         try:
@@ -1433,12 +1520,12 @@ if HAS_SHAP:
 # 16. LINEAR PROBABILITY MODEL BASELINE
 # =============================================================================
 #
-# Retained because it was requested. Ordinary least squares on a binary
-# outcome is a linear probability model: it can predict outside [0, 1], its
-# errors are heteroscedastic by construction, and R-squared against a binary
-# outcome is not interpretable as explained variance in the usual sense. It
-# is reported as a sanity check on whether a strictly linear, unregularised
-# fit recovers comparable discrimination, not as a competing model.
+# Ordinary least squares on a binary outcome is a linear probability model:
+# it can predict outside [0, 1], its errors are heteroscedastic by
+# construction, and R-squared against a binary outcome is not interpretable
+# as explained variance in the usual sense. It is reported as a sanity check
+# on whether a strictly linear, unregularised fit recovers comparable
+# discrimination, not as a competing model.
 
 lpm_rows = []
 
@@ -1480,6 +1567,9 @@ save_table(lpm_df, "07_Linear_Probability_Baseline.csv")
 # =============================================================================
 # 17. EXPORTS AND RUN SUMMARY
 # =============================================================================
+#
+# Tables 08 and 09 contain row-level respondent data. They are written for
+# local audit only and are excluded from version control by .gitignore.
 
 oof_export = pd.DataFrame({"Observed_PCOS": y.values})
 for set_name, payload in all_results.items():

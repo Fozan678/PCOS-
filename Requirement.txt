@@ -1,0 +1,12 @@
+numpy
+pandas
+openpyxl
+scipy
+scikit-learn
+matplotlib
+seaborn
+joblib
+# Optional: the script skips these models or sections if they are missing
+xgboost
+lightgbm
+shap
